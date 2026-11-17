@@ -1,36 +1,110 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Repo-chat
 
-## Getting Started
+Paste a public GitHub repository URL. You get an architecture brief — what the project
+does, its tech stack, how it is structured, the files that matter, and a rendered flow
+diagram — and then you can ask the codebase questions. Answers cite real files, and
+clicking a citation opens that file at the cited line.
 
-First, run the development server:
+## Setup
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+pnpm install
+pnpm dev     # http://localhost:3000
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Then click **API key** and paste an Anthropic key from
+[console.anthropic.com](https://console.anthropic.com/settings/keys). That's the whole
+setup — no env file needed.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### Bring your own key
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+A key entered in the app is held in that browser's `localStorage` and sent with each
+request as an `X-Anthropic-Key` header. The server uses it for that one request and
+drops it: it is never written to disk, never stored in SQLite, and never logged. Saving
+a key validates it against the Models API first, which checks auth and model access
+without generating any tokens, so it costs nothing.
 
-## Learn More
+Opening **API key** again lets you test the saved key or remove it. Removing it falls
+back to the server's key, if there is one.
 
-To learn more about Next.js, take a look at the following resources:
+### Or let the server hold the key
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+Set `ANTHROPIC_API_KEY` in `.env.local` and everyone who opens the app can use it
+without entering anything:
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+```bash
+cp .env.example .env.local   # uncomment and fill in ANTHROPIC_API_KEY
+```
 
-## Deploy on Vercel
+A key entered in the browser always wins over the server's. `GITHUB_TOKEN` is optional
+and only raises GitHub's metadata rate limit — repo-chat makes exactly one GitHub API
+call per repository, so you almost certainly don't need it.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## How it works
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```
+paste URL
+  → GET api.github.com/repos/{owner}/{repo}      one call: default branch, description, stars
+  → GET codeload.github.com/.../tar.gz/{ref}     one download, extracted to .cache/repos/
+  → walk + filter                                manifest: paths, line counts, language mix
+  → Claude agentic loop over local file tools     streamed brief + mermaid diagram
+  → SQLite                                       reopening a repo is instant and free
+```
+
+The repository is downloaded **once** as a tarball and read from disk after that, so the
+file tools are not subject to GitHub's API rate limit and each read is local-disk fast.
+Claude works through four read-only tools — `list_files`, `search_code`, `read_file` and
+`read_many_files` — and the complete file manifest sits in a cached system prompt, so it
+always knows the shape of the repo and spends tool calls only on files it actually wants.
+
+Every filesystem read is resolved through `safeResolve()` in `lib/repo-cache.ts`, which
+rejects anything escaping the repository root. Tarballs are extracted with symlinks and
+traversal entries filtered out and a hard cap on uncompressed bytes.
+
+## Layout
+
+| Path                 | Purpose                                                                  |
+| -------------------- | ------------------------------------------------------------------------ |
+| `lib/github.ts`      | URL parsing, repo metadata, tarball download and safe extraction         |
+| `lib/repo-cache.ts`  | File manifest, language breakdown, path-containment guard                |
+| `lib/tools.ts`       | The four read-only tools Claude drives                                   |
+| `lib/prompts.ts`     | The cached repo-context prompt and the brief's output contract           |
+| `lib/claude.ts`      | Anthropic client, model settings, streaming agent loop                   |
+| `lib/key-store.ts`   | Browser-side storage for a bring-your-own key                            |
+| `lib/request-key.ts` | Reads the per-request key header on the server                           |
+| `lib/agent.ts`       | Ingest → analyse → answer orchestration                                  |
+| `lib/db.ts`          | SQLite schema and queries                                                |
+| `app/api/*`          | SSE endpoints for analyse, chat, file reads, repo listing and key checks |
+| `components/*`       | Markdown renderer, mermaid diagram, chat, file tree and viewer           |
+
+## Scripts
+
+```bash
+pnpm dev          # dev server
+pnpm build        # production build
+pnpm typecheck    # tsc --noEmit
+pnpm smoke <url> ["question"]   # end-to-end check with no UI involved
+```
+
+`pnpm smoke` ingests a repository, prints the streamed brief, and verifies that all six
+sections and the mermaid block are present. Pass a second argument to also run one chat
+turn. It's the fastest way to check the agent loop after changing a prompt. It reads the
+key from the environment, so either keep one in `.env.local` or pass it inline:
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-... pnpm smoke https://github.com/vercel/ms
+```
+
+## Tuning
+
+Model and effort live as constants at the top of `lib/claude.ts` (`MODEL`, `EFFORT`,
+`MAX_TOKENS`, `MAX_ITERATIONS`). The brief's structure is the output contract in
+`lib/prompts.ts` — edit the headings there and the UI follows.
+
+## Local state
+
+- `.cache/repos/` — extracted repositories, keyed by `owner__repo__ref`
+- `data/repo-chat.db` — briefs and chat history
+
+Both are gitignored and safe to delete; deleting them just means the next open re-downloads
+and re-analyses.
